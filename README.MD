@@ -1,19 +1,19 @@
 # Cloudflare 优选 IP
 
-**测试地**: 中国江苏电信  
+**测试地**: 中国江苏电信
 **更新频率**: 随缘更新  
-**本次更新**: 2026-05-13 11:06:06
+**本次更新**: 2026-05-13 11:31:18
 
 ## 订阅链接
 **Cloudflare R2 订阅连接（推荐）**：
 
   - 高速优选：
 ```bash
-https://ips.gaoji.uk/best_ips.txt
+https://ips.rawgo.tech/best_ips.txt
 ```
   - 所有可用：
 ```bash
-https://ips.gaoji.uk/full_ips.txt
+https://ips.rawgo.tech/full_ips.txt
 ```
 
 #
