@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+import asyncio, os, shutil, subprocess, sys, time, urllib.request
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from tqdm import tqdm
+
+# --- 核心：从环境变量加载所有精细化参数 ---
+# 延迟测试配置
+TCP_WORKERS = int(os.getenv("TCP_WORKERS", 400))
+TCP_TIMEOUT = float(os.getenv("TCP_TIMEOUT", 1.5))
+
+# 测速引擎配置
+SPEED_WORKERS = int(os.getenv("SPEED_WORKERS", 12))
+SPEED_TIMEOUT = float(os.getenv("SPEED_TIMEOUT", 6.0))
+# 引入缓冲区参数，默认为 16.0 秒
+SPEED_PROCESS_BUFFER = float(os.getenv("SPEED_PROCESS_BUFFER", 16.0))
+SPEED_MIN_MBPS = float(os.getenv("SPEED_MIN", 8.0))
+
+# 数量控制
+MAX_NODES = int(os.getenv("MAX_NODES", 1000000)) # 默认全量
+TOP_PER_REGION = int(os.getenv("TOP_PER_REGION", 10))
+
+# 资源与文件配置
+DOWNLOAD_TIMEOUT = float(os.getenv("DOWNLOAD_TIMEOUT", 60.0))
+INPUT_URL = os.getenv("INPUT_URL")
+if not INPUT_URL:
+    print("❌ 严重错误: 检测到 .env 配置失效或缺少 INPUT_URL！")
+    print("💡 为了防止运行偏离预期，程序已自动终止。")
+    sys.exit(1)
+
+# === 【唯一新增的容错逻辑】 ===
+# 如果老哥手快少写了协议头，自动在这里原地补齐，确保 urllib 能够解析
+if "://" not in INPUT_URL:
+    INPUT_URL = f"http://{INPUT_URL}"
+# ==============================
+
+# 文件名
+INPUT_FILE = Path("ips.txt")
+BEST_OUTPUT = Path("best_ips.txt")
+FULL_OUTPUT = Path("full_ips.txt")
+
+# 测速节点固定参数
+SPEED_DOMAIN = "speed.cloudflare.com"
+SPEED_PATH = "/__down"
+SPEED_BYTES = 2 * 1024 * 1024
+FAST_LABEL = "⚡"
+
+@dataclass(frozen=True)
+class Node:
+    ip: str; port: int; region: str
+    @property
+    def raw(self) -> str: return f"{self.ip}:{self.port}#{self.region}"
+
+def refresh_ips():
+    print(f"IP 来源: {INPUT_URL}")
+    try:
+        req = urllib.request.Request(INPUT_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
+            if resp.status == 200:
+                INPUT_FILE.write_bytes(resp.read())
+                return True
+    except: pass
+    return INPUT_FILE.exists()
+
+def load_nodes():
+    nodes, seen = [], set()
+    if not INPUT_FILE.exists(): return []
+    for line in INPUT_FILE.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line or "#" not in line: continue
+        try:
+            addr, reg = line.split("#", 1)
+            ip, port = addr.rsplit(":", 1)
+            n = Node(ip.strip(), int(port), reg.strip())
+            if n not in seen:
+                seen.add(n); nodes.append(n)
+        except: continue
+    return nodes[:MAX_NODES]
+
+async def tcping(node: Node):
+    start = time.perf_counter()
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(node.ip, node.port), timeout=TCP_TIMEOUT)
+        writer.close(); await writer.wait_closed()
+        return round((time.perf_counter() - start) * 1000, 2)
+    except: return None
+
+def measure_speed(node: Node):
+    curl = shutil.which("curl") or shutil.which("curl.exe")
+    url = f"https://{SPEED_DOMAIN}:{node.port}{SPEED_PATH}?bytes={SPEED_BYTES}"
+    cmd = [
+            curl, 
+            "-s", 
+            "-o", os.devnull, # 使用 os.devnull 增强跨平台兼容性
+            "-w", "%{size_download} %{time_total}",
+            "--resolve", f"{SPEED_DOMAIN}:{node.port}:{node.ip}",
+            "--connect-timeout", "2", 
+            "--max-time", str(SPEED_TIMEOUT), 
+            "--insecure",
+            "-L",              # 跟随重定向
+            "--http1.1",       # 强制 HTTP/1.1 避免某些环境 HTTP2 握手慢
+            url
+            ]
+    try:
+        # 使用 SPEED_TIMEOUT + SPEED_PROCESS_BUFFER 作为进程级的物理死线
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=SPEED_TIMEOUT + SPEED_PROCESS_BUFFER)
+        size, t = res.stdout.strip().split()
+        return round((float(size) * 8) / (float(t) * 1_000_000), 2)
+    except: return 0.0
+
+def get_flag_emoji(country_code: str) -> str:
+    """将二字码（如 JP, US）转换为国旗 Emoji，若非纯字母则不转换"""
+    code = country_code.strip().upper()
+    # 过滤掉一些可能已经包含特殊字符的别名，确保只有2位纯字母时才转换
+    if len(code) == 2 and code.isalpha():
+        # 利用 Unicode 区域指示符号的偏移量进行转换
+        return "".join(chr(127397 + ord(c)) for c in code)
+    return ""
+
+async def main():
+    start_time = time.time()
+    if not refresh_ips():
+        print("❌ 无法获取 IP 列表")
+        return
+    
+    nodes = load_nodes()
+    total_nodes = len(nodes)
+    print(f"🚀 参数就绪：并发{TCP_WORKERS}, 最高延迟{TCP_TIMEOUT}s, 目标{total_nodes}个")
+
+    # 1. TCP 延迟测试
+    tcp_results = []
+    pbar = tqdm(total=total_nodes, desc="TCP 延迟测试")
+    sem = asyncio.Semaphore(TCP_WORKERS)
+    async def task(n):
+        async with sem:
+            lat = await tcping(n)
+            if lat: tcp_results.append((n, lat))
+            pbar.update(1)
+    await asyncio.gather(*(task(n) for n in nodes))
+    pbar.close()
+
+    # 2. 分组筛选
+    groups = defaultdict(list)
+    for n, lat in tcp_results: groups[n.region].append((n, lat))
+    candidates = []
+    for reg in groups:
+        candidates.extend(sorted(groups[reg], key=lambda x: x[1])[:TOP_PER_REGION])
+
+    # 3. 速度测试
+    print(f"📢 测速阶段：并发{SPEED_WORKERS}, 最低速度{SPEED_MIN_MBPS}Mbps, 目标{len(candidates)}个")
+    speed_results = []
+    pbar_s = tqdm(total=len(candidates), desc="下载速度测试")
+    loop = asyncio.get_event_loop()
+    sem_s = asyncio.Semaphore(SPEED_WORKERS)
+    async def s_task(n, lat):
+        async with sem_s:
+            s = await loop.run_in_executor(None, measure_speed, n)
+            speed_results.append((n, lat, s))
+            pbar_s.update(1)
+    await asyncio.gather(*(s_task(n, lat) for n, lat in candidates))
+    pbar_s.close()
+
+    # 4. 排序与结果写入
+    speed_results.sort(key=lambda x: (x[1], -x[2]))
+    fast_count = 0
+    with FULL_OUTPUT.open("w", encoding="utf-8") as f1, BEST_OUTPUT.open("w", encoding="utf-8") as f2:
+        for n, lat, s in speed_results:
+            is_fast = s >= SPEED_MIN_MBPS
+            # 1. 提取或生成国旗 Emoji
+            flag = get_flag_emoji(n.region)        
+            # 2. 拼接出 🇯🇵JP 这样的地区标签
+            region_with_flag = f"{flag}{n.region}"         
+            # 3. 达标的“优选高速”节点带上 ⚡ 标志
+            tag = FAST_LABEL if is_fast else ""
+            # 4. 严格按照要求的格式输出
+            line = f"{n.ip}:{n.port}#{region_with_flag}{tag}[{lat}ms-{s}Mbps]\n"
+            f1.write(line)
+            if is_fast:
+                f2.write(line)
+                fast_count += 1               
+
+    duration = int(time.time() - start_time)
+    print(f"✨ 优选任务完成！总耗时: {duration}s")
+    print(f"📊 IP 总数: {total_nodes}")
+    print(f"✅ TCP 存活: {len(tcp_results)} ({round(len(tcp_results)/total_nodes*100, 1)}%)")
+    print(f"⚡ 测速候选: {len(candidates)}")
+    print(f"🏆 达标优选: {fast_count}")
+    print("⭕ 结果已更新")
+
+if __name__ == "__main__":
+    asyncio.run(main())
