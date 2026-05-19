@@ -96,13 +96,13 @@ EOF
         echo "[$(date '+%H:%M:%S')] 🐙 上传至 GitHub 仓库..."
         REPO_OWNER="$GH_OWNER"
         REPO_NAME="$GH_REPO_NAME"
-        TOP_IP=$(head -n 1 best_ips.txt | awk '{print $1}')
+        BEST_COUNT=$(wc -l < best_ips.txt 2>/dev/null || echo "0")
 
         if [ "$GH_SYNC_MODE" == "push" ]; then
             [ "$GH_USE_PROXY" == "true" ] && FINAL_GH_HOST="$GH_PROXY_DOMAIN" || FINAL_GH_HOST="github.com"
             PUSH_URL="https://${GH_TOKEN}@${FINAL_GH_HOST}/${REPO_OWNER}/${REPO_NAME}.git"
             git add .
-            git commit -m "Update IPs: $TOP_IP" || echo "    💡 无变动"
+            git commit -m "Update IPs: $BEST_COUNT" || echo "    💡 无变动"
             git push "$PUSH_URL" main --force && GH_MSG="✅ 成功 (Push)" || GH_MSG="❌ 失败 (Push)"
         else
             [ "$GH_USE_PROXY" == "true" ] && API_DOMAIN="$GH_PROXY_DOMAIN" || API_DOMAIN="api.github.com"
@@ -115,7 +115,8 @@ EOF
                 CONTENT=$(base64 -w 0 "$FILE")
                 SHA_FIELD=""
                 [ -n "$SHA" ] && SHA_FIELD="\"sha\": \"$SHA\","
-                RESPONSE=$(curl -s -X PUT -H "Authorization: token $GH_TOKEN" -H "Content-Type: application/json" -H "Accept: application/vnd.github+json" -H "User-Agent: $UA" -d "{$SHA_FIELD \"message\": \"Update $FILE: $TOP_IP\", \"content\": \"$CONTENT\"}" "$API_BASE")
+                FILE_COUNT=$(wc -l < "$FILE" 2>/dev/null || echo "0")
+                RESPONSE=$(curl -s -X PUT -H "Authorization: token $GH_TOKEN" -H "Content-Type: application/json" -H "Accept: application/vnd.github+json" -H "User-Agent: $UA" -d "{$SHA_FIELD \"message\": \"Update $FILE: $FILE_COUNT\", \"content\": \"$CONTENT\"}" "$API_BASE")
                 [[ "$RESPONSE" == *"\"content\":"* ]] || GH_SUCCESS=false
             done
             $GH_SUCCESS && GH_MSG="✅ 成功 (API)" || GH_MSG="❌ 失败 (API)"
