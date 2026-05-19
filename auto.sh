@@ -115,8 +115,12 @@ EOF
                 CONTENT=$(base64 -w 0 "$FILE")
                 SHA_FIELD=""
                 [ -n "$SHA" ] && SHA_FIELD="\"sha\": \"$SHA\","
-                FILE_COUNT=$(wc -l < "$FILE" 2>/dev/null || echo "0")
-                RESPONSE=$(curl -s -X PUT -H "Authorization: token $GH_TOKEN" -H "Content-Type: application/json" -H "Accept: application/vnd.github+json" -H "User-Agent: $UA" -d "{$SHA_FIELD \"message\": \"Update $FILE: $FILE_COUNT\", \"content\": \"$CONTENT\"}" "$API_BASE")
+                if [ "$FILE" == "README.MD" ]; then
+                    FILE_INFO=$(date '+%y/%m/%d %H:%M')
+                else
+                    FILE_INFO=$(wc -l < "$FILE" 2>/dev/null || echo "0")
+                fi
+                RESPONSE=$(curl -s -X PUT -H "Authorization: token $GH_TOKEN" -H "Content-Type: application/json" -H "Accept: application/vnd.github+json" -H "User-Agent: $UA" -d "{$SHA_FIELD \"message\": \"Update $FILE: $FILE_INFO\", \"content\": \"$CONTENT\"}" "$API_BASE")
                 [[ "$RESPONSE" == *"\"content\":"* ]] || GH_SUCCESS=false
             done
             $GH_SUCCESS && GH_MSG="✅ 成功 (API)" || GH_MSG="❌ 失败 (API)"
